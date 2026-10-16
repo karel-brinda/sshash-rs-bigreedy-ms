@@ -2,11 +2,12 @@
 
 > [!IMPORTANT]
 > **This repository ([karel-brinda/sshash-rs-bigreedy-ms](https://github.com/karel-brinda/sshash-rs-bigreedy-ms))
-> is a fork of [sshash-rs](https://github.com/COMBINE-lab/sshash-rs), the Rust implementation of
-> SSHash, extended to natively index
-> [masked superstrings](https://doi.org/10.1101/2023.02.01.526717) computed by BiGreedy, as
-> output by [KmerCamel](https://github.com/ondrejsladky/kmercamel). It is a Rust port of the
-> C++ fork [karel-brinda/sshash-bigreedy-ms](https://github.com/karel-brinda/sshash-bigreedy-ms).**
+> is a hybrid of two codebases: a fork of Rob Patro's
+> [sshash-rs](https://github.com/COMBINE-lab/sshash-rs), the Rust implementation of SSHash,
+> extended with the masked-superstring design of the C++ fork
+> [karel-brinda/sshash-bigreedy-ms](https://github.com/karel-brinda/sshash-bigreedy-ms), so that
+> it natively indexes [masked superstrings](https://doi.org/10.1101/2023.02.01.526717) computed
+> by BiGreedy, as output by [KmerCamel](https://github.com/ondrejsladky/kmercamel).**
 >
 > * **New input format.** `--masked-superstring` indexes one KmerCamel-style masked superstring:
 >   a single FASTA record over `ACGTacgt`, where an uppercase base marks the start of a
