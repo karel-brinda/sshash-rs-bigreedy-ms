@@ -57,13 +57,11 @@ pub fn masked_superstring_intervals(
         return Err("masked-superstring input is shorter than k".to_string());
     }
 
-    for pos in (n - k + 1)..n {
-        if is_on_mask_char(seq[pos]) {
-            return Err(
-                "masked-superstring input has an uppercase character in its final k-1 positions"
-                    .to_string(),
-            );
-        }
+    if seq[(n - k + 1)..].iter().any(|&c| is_on_mask_char(c)) {
+        return Err(
+            "masked-superstring input has an uppercase character in its final k-1 positions"
+                .to_string(),
+        );
     }
 
     let mut intervals = Vec::new();

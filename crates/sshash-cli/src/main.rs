@@ -773,7 +773,7 @@ where
 
     let mut expected_kmer_id = 0u64;
     let mut failures = 0u64;
-    let mut report = |msg: String, failures: &mut u64| {
+    let report = |msg: String, failures: &mut u64| {
         *failures += 1;
         if *failures <= 10 {
             warn!("{}", msg);
