@@ -49,7 +49,12 @@ pub struct MinimizerTuple {
     /// The minimizer value (m-mer)
     pub minimizer: u64,
 
-    /// Position of the minimizer in the sequence (in bases from string start)
+    /// Position of the minimizer occurrence, encoded as
+    /// `| string-id | offset relative to the string's begin |` (see
+    /// `SpectrumPreservingStringSet::encode_offset`), so that the same text
+    /// position stays distinguishable when strings are overlapping intervals
+    /// of one text. Unit tests may use raw values; the build pipeline treats
+    /// the field as opaque except for equality and ordering.
     pub pos_in_seq: u64,
 
     /// The selected locus within the k-mer window (0 to k-m), in the
@@ -177,6 +182,9 @@ where
     let string_begin = spss.string_offset(string_id);
     minimizer_iter.set_position(string_begin);
 
+    // Minimizer positions are stored string-id-encoded (see MinimizerTuple).
+    let encoded_string_id = string_id << spss.rel_offset_bits();
+
     // COALESCING DURING EXTRACTION - matching C++ behavior exactly
     // Track the previous minimizer info to detect when it changes
     let mut prev_mini_tuple: Option<MinimizerTuple> = None;
@@ -188,7 +196,7 @@ where
 
         // The unified canonical scheme: one iterator, one order, both strands.
         // `position` is the absolute (tie-broken) minimizer position in the
-        // concatenated SPSS; lookup recovers kmer_start = pos_in_seq - pos_in_kmer.
+        // shared text; lookup recovers kmer_start = minimizer_pos - pos_in_kmer.
         let kmer_rc = kmer.reverse_complement();
         let mini = minimizer_iter.next(&kmer, &kmer_rc);
         debug_assert_eq!(
@@ -198,7 +206,7 @@ where
 
         let current_mini = MinimizerTuple {
             minimizer: mini.value,
-            pos_in_seq: mini.position,
+            pos_in_seq: encoded_string_id | (mini.position - string_begin),
             pos_in_kmer: mini.pos_in_kmer as u8,
             num_kmers_in_super_kmer: 1, // Will be updated during coalescing
         };
@@ -415,7 +423,10 @@ where
         let mut minimizer_iter = MinimizerIterator::with_seed(k, m, config.seed);
         let string_begin = spss.string_offset(string_id as u64);
         minimizer_iter.set_position(string_begin);
-        
+
+        // Minimizer positions are stored string-id-encoded (see MinimizerTuple).
+        let encoded_string_id = (string_id as u64) << spss.rel_offset_bits();
+
         // Track previous minimizer for coalescing
         let mut prev_mini: Option<MinimizerTupleExternal> = None;
         let mut num_kmers_in_super_kmer: u8 = 0;
@@ -432,7 +443,7 @@ where
 
             let current = MinimizerTupleExternal {
                 minimizer: mini.value,
-                pos_in_seq: mini.position,
+                pos_in_seq: encoded_string_id | (mini.position - string_begin),
                 pos_in_kmer: mini.pos_in_kmer as u8,
                 num_kmers_in_super_kmer: 1,
             };

@@ -48,6 +48,14 @@ enum Commands {
         #[arg(short = 'r', long, default_value = "8")]
         ram_limit: usize,
 
+        /// Interpret the input as one KmerCamel-style masked superstring: a
+        /// single FASTA record over ACGTacgt, where uppercase bases mark
+        /// represented k-mer starts (the mask MUST be min-one: exactly one
+        /// uppercase occurrence per represented k-mer, as `kmercamel compute`
+        /// outputs by default). Only the represented k-mers are indexed.
+        #[arg(long, default_value = "false")]
+        masked_superstring: bool,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -83,6 +91,13 @@ enum Commands {
         /// Input file used to build the dictionary
         #[arg(short = 'f', long)]
         input: String,
+
+        /// The input is the masked superstring the index was built from
+        /// (with `build --masked-superstring`): verifies that k-mer ids are
+        /// the ranks of the uppercase positions in text order, which fails
+        /// on any non-min-one mask.
+        #[arg(long, default_value = "false")]
+        masked_superstring: bool,
 
         /// Use streaming query for validation (FASTA/FASTQ only)
         #[arg(long, default_value = "false")]
@@ -150,14 +165,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { input, k, m, output, canonical, threads, ram_limit, verbose } => {
-            build_command(input, k, m, output, canonical, threads, ram_limit, verbose)?;
+        Commands::Build { input, k, m, output, canonical, threads, ram_limit, masked_superstring, verbose } => {
+            build_command(input, k, m, output, canonical, threads, ram_limit, masked_superstring, verbose)?;
         }
         Commands::Query { index, query, streaming, forward_only } => {
             query_command(index, query, streaming, forward_only)?;
         }
-        Commands::Check { index, input, streaming } => {
-            check_command(index, input, streaming)?;
+        Commands::Check { index, input, masked_superstring, streaming } => {
+            check_command(index, input, masked_superstring, streaming)?;
         }
         Commands::Bench { index } => {
             bench_command(index)?;
@@ -176,7 +191,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build a dictionary from FASTA/FASTQ input
+/// Build a dictionary from FASTA/FASTQ input (or a masked superstring)
 #[allow(clippy::too_many_arguments)]
 fn build_command(
     input: String,
@@ -186,6 +201,7 @@ fn build_command(
     canonical: bool,
     threads: usize,
     ram_limit: usize,
+    masked_superstring: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
     info!("Building SSHash dictionary...");
@@ -193,11 +209,7 @@ fn build_command(
     info!("  k: {}", k);
     info!("  m: {}", m);
     info!("  RAM limit: {} GiB", ram_limit);
-    
-    // Read sequences - detect format by trying FASTA/FASTQ first, then plain text
-    let sequences = parse_sequences_file(&input)?;
-    info!("  Loaded {} sequences", sequences.len());
-    
+
     // Create builder configuration
     let mut config = BuildConfiguration::new(k, m)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -207,13 +219,23 @@ fn build_command(
     config.verbose = verbose;
     config.ram_limit_gib = ram_limit;
     config.num_threads = threads;
-    
+
     // Build dictionary
     let builder = DictionaryBuilder::new(config)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let dict = builder.build_from_sequences(sequences)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    
+    let dict = if masked_superstring {
+        let ms = read_masked_superstring_file(&input)?;
+        info!("  Loaded masked superstring of {} bases", ms.len());
+        builder.build_from_masked_superstring(&ms)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+    } else {
+        // Read sequences - detect format by trying FASTA/FASTQ first, then plain text
+        let sequences = parse_sequences_file(&input)?;
+        info!("  Loaded {} sequences", sequences.len());
+        builder.build_from_sequences(sequences)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+    };
+
     // Determine output filename
     let output_path = output.unwrap_or_else(|| {
         let input_path = Path::new(&input);
@@ -706,7 +728,12 @@ where
 }
 
 /// Check dictionary correctness by re-querying all k-mers from input
-fn check_command(index: String, input: String, streaming: bool) -> anyhow::Result<()> {
+fn check_command(
+    index: String,
+    input: String,
+    masked_superstring: bool,
+    streaming: bool,
+) -> anyhow::Result<()> {
     let index = normalize_index_path(&index);
     info!("Checking dictionary correctness...");
     info!("  Index: {}", index);
@@ -715,10 +742,126 @@ fn check_command(index: String, input: String, streaming: bool) -> anyhow::Resul
     let dict = Dictionary::load(&index)?;
     let k = dict.k();
     info!("Dictionary loaded (k={}, m={})", k, dict.m());
-    
+
+    if masked_superstring {
+        return sshash_lib::dispatch_on_k!(k, K => {
+            check_masked_superstring_with_k::<K>(&dict, &input)
+        });
+    }
+
     sshash_lib::dispatch_on_k!(k, K => {
         check_with_k::<K>(&dict, &input, streaming)
     })
+}
+
+/// Verify a dictionary built from a masked superstring against that
+/// superstring: with a min-one mask, k-mer ids must be the ranks of the
+/// uppercase positions taken in text order, each with the metadata of the
+/// enclosing maximal uppercase run. Any non-min-one mask fails this check.
+fn check_masked_superstring_with_k<const K: usize>(
+    dict: &Dictionary,
+    input: &str,
+) -> anyhow::Result<()>
+where
+    Kmer<K>: KmerBits,
+{
+    let ms = read_masked_superstring_file(input)?;
+    let intervals = sshash_lib::masked_superstring_intervals(ms.as_bytes(), K)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    info!("Checking lookups over the masked superstring...");
+
+    let mut expected_kmer_id = 0u64;
+    let mut failures = 0u64;
+    let mut report = |msg: String, failures: &mut u64| {
+        *failures += 1;
+        if *failures <= 10 {
+            warn!("{}", msg);
+        }
+    };
+
+    for (string_id, interval) in intervals.iter().enumerate() {
+        for pos in interval.begin..=(interval.end - K as u64) {
+            let bytes = &ms.as_bytes()[pos as usize..pos as usize + K];
+            let kmer = Kmer::<K>::from_ascii_unchecked(bytes);
+            // Transform 50% of the queries into their reverse complements.
+            let (queried, expect_orientation) = if expected_kmer_id & 1 == 1 {
+                (kmer.reverse_complement(), -1)
+            } else {
+                (kmer, 1)
+            };
+
+            let res = dict.query::<K>(&queried);
+            if res.kmer_id != expected_kmer_id {
+                report(
+                    format!(
+                        "position {}: expected kmer_id {} but got {}",
+                        pos, expected_kmer_id, res.kmer_id
+                    ),
+                    &mut failures,
+                );
+            } else if res.string_id != string_id as u64
+                || res.kmer_offset != pos
+                || res.kmer_id_in_string != pos - interval.begin
+                || res.string_begin != interval.begin
+                || res.string_end != interval.end
+                || res.kmer_orientation != expect_orientation
+            {
+                report(
+                    format!(
+                        "position {}: wrong metadata (string_id {} offset {} in_string {} [{}, {}) orientation {})",
+                        pos, res.string_id, res.kmer_offset, res.kmer_id_in_string,
+                        res.string_begin, res.string_end, res.kmer_orientation
+                    ),
+                    &mut failures,
+                );
+            }
+
+            expected_kmer_id += 1;
+            if expected_kmer_id.is_multiple_of(5_000_000) {
+                info!("  Checked {} k-mers...", expected_kmer_id);
+            }
+        }
+    }
+
+    if expected_kmer_id != dict.num_kmers() {
+        failures += 1;
+        warn!(
+            "checked {} k-mers but the dictionary has {}",
+            expected_kmer_id,
+            dict.num_kmers()
+        );
+    }
+
+    println!("\n=== Masked Superstring Check Results ===");
+    println!("  Total k-mers: {}", expected_kmer_id);
+    println!("  Failures: {}", failures);
+    if failures > 0 {
+        println!("\n✗ CHECK FAILED! The mask may not be min-one.");
+        std::process::exit(1);
+    }
+    println!("\n✓ CHECK PASSED!");
+    Ok(())
+}
+
+/// Read one masked superstring from a FASTA file (optionally gzipped),
+/// preserving case. The file must contain exactly one record over ACGTacgt.
+fn read_masked_superstring_file(path: &str) -> anyhow::Result<String> {
+    use needletail::parse_fastx_file;
+
+    let mut reader = parse_fastx_file(path)?;
+    let record = reader
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("masked-superstring input contains no FASTA record"))??;
+    let seq = record.seq().to_vec();
+    if reader.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "masked-superstring input must contain exactly one FASTA record"
+        ));
+    }
+    sshash_lib::masked_superstring::validate_masked_superstring(&seq)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(String::from_utf8(seq)?)
 }
 
 fn check_with_k<const K: usize>(dict: &Dictionary, input: &str, streaming: bool) -> anyhow::Result<()>

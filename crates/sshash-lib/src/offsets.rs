@@ -64,6 +64,12 @@ impl OffsetsVector {
         DecodedOffset::new(absolute_offset, absolute_offset)
     }
 
+    /// Consume the vector and return the raw offsets.
+    #[inline]
+    pub fn into_inner(self) -> Vec<u64> {
+        self.offsets
+    }
+
     /// Get the number of offsets
     #[inline]
     pub fn len(&self) -> usize {

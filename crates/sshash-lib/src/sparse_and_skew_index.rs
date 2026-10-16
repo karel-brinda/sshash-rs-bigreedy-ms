@@ -40,9 +40,10 @@ pub struct SparseAndSkewIndex {
     ///   end   = ef.access(id+1) + id + 1
     pub num_super_kmers_before_bucket: EliasFanoOffsets,
 
-    /// One entry per super-kmer: absolute offset (pos_in_seq) into SPSS.
-    /// Entries are ordered by bucket (in MPHF order), then by position within
-    /// each bucket.
+    /// One entry per super-kmer: the minimizer occurrence's offset into the
+    /// SPSS, encoded as `| string-id | relative offset |` (decode with
+    /// `SpectrumPreservingStringSet::decode_offset`). Entries are ordered by
+    /// bucket (in MPHF order), then by position within each bucket.
     pub offsets: BitFieldVec,
 
     /// Skew index for heavy buckets (size > MIN_BUCKET_SIZE)
@@ -642,9 +643,11 @@ impl SkewIndex {
             for tuple in bucket_tuples {
                 pos_in_bucket += 1;
 
-                debug_assert!(tuple.pos_in_seq >= tuple.pos_in_kmer as u64);
-                let starting_kmer_pos =
-                    (tuple.pos_in_seq - tuple.pos_in_kmer as u64) as usize;
+                // pos_in_seq is string-id-encoded; the text read needs the
+                // absolute position of the minimizer occurrence.
+                let minimizer_pos = spss.decode_offset(tuple.pos_in_seq).absolute;
+                debug_assert!(minimizer_pos >= tuple.pos_in_kmer as u64);
+                let starting_kmer_pos = (minimizer_pos - tuple.pos_in_kmer as u64) as usize;
 
                 for kmer_offset in 0..tuple.num_kmers_in_super_kmer {
                     let kmer: Kmer<K> = spss.decode_kmer_at(starting_kmer_pos + kmer_offset as usize);

@@ -57,9 +57,14 @@ struct LocatedHit {
 
 impl LocatedHit {
     #[inline]
-    fn into_lookup_result(self, k: usize) -> crate::streaming_query::LookupResult {
+    fn into_lookup_result(
+        self,
+        spss: &SpectrumPreservingStringSet,
+    ) -> crate::streaming_query::LookupResult {
         let kmer_id_in_string = self.kmer_offset - self.string_begin;
-        let kmer_id = self.kmer_offset - self.string_id * (k as u64 - 1);
+        // Strings are intervals of one text, so the global id is the string's
+        // first k-mer id (the cumulative k-mer count) plus the relative id.
+        let kmer_id = spss.first_kmer_id(self.string_id) + kmer_id_in_string;
         crate::streaming_query::LookupResult {
             kmer_id,
             kmer_id_in_string,
@@ -313,14 +318,15 @@ impl Dictionary {
             if within_pos == INVALID_UINT64 || within_pos as usize >= n {
                 return crate::streaming_query::LookupResult::not_found();
             }
-            let minimizer_pos = self.index.offsets.index_value(begin + within_pos as usize) as u64;
-            if !self.mmer_matches(minimizer_pos, mini.value) {
+            let encoded = self.index.offsets.index_value(begin + within_pos as usize) as u64;
+            let dec = self.spss.decode_offset(encoded);
+            if !self.mmer_matches(dec.absolute, mini.value) {
                 // A foreign k-mer probes an arbitrary in-bucket position, so a
                 // mismatch here says nothing about the minimizer's presence.
                 return crate::streaming_query::LookupResult::not_found();
             }
-            match self.lookup_at_position(kmer, kmer_rc, minimizer_pos, mini.pos_in_kmer) {
-                Some(hit) => hit.into_lookup_result(self.k),
+            match self.lookup_at_position(kmer, kmer_rc, &dec, mini.pos_in_kmer) {
+                Some(hit) => hit.into_lookup_result(&self.spss),
                 None => crate::streaming_query::LookupResult::not_found(),
             }
         } else {
@@ -328,8 +334,8 @@ impl Dictionary {
             // same minimizer, so one presence probe decides for the whole set:
             // a mismatch means an out-of-set minimizer collided into this
             // bucket through the MPHF.
-            let first_pos = self.index.offsets.index_value(begin) as u64;
-            if !self.mmer_matches(first_pos, mini.value) {
+            let first = self.spss.decode_offset(self.index.offsets.index_value(begin) as u64);
+            if !self.mmer_matches(first.absolute, mini.value) {
                 if let Some(c) = cache {
                     c.size = 0;
                 }
@@ -343,22 +349,26 @@ impl Dictionary {
                 // Decode into the cache (no extra cost — the verification
                 // consumes the same values) so a streaming follow-up with
                 // this minimizer skips the MPHF/EF/offset work entirely.
-                c.positions[0] = first_pos;
+                // Absolute positions are cached, so verification locates the
+                // containing string by successor query on the interval ends.
+                c.positions[0] = first.absolute;
                 for i in 1..n {
-                    c.positions[i] = self.index.offsets.index_value(begin + i) as u64;
+                    let enc = self.index.offsets.index_value(begin + i) as u64;
+                    c.positions[i] = self.spss.decode_offset(enc).absolute;
                 }
                 c.size = n;
                 let positions = c.positions;
                 return self.lookup_at_positions(&positions[..n], kmer, kmer_rc, mini);
             }
             // No caching: verify straight off the offsets array, no buffering.
-            if let Some(hit) = self.lookup_at_position(kmer, kmer_rc, first_pos, mini.pos_in_kmer) {
-                return hit.into_lookup_result(self.k);
+            if let Some(hit) = self.lookup_at_position(kmer, kmer_rc, &first, mini.pos_in_kmer) {
+                return hit.into_lookup_result(&self.spss);
             }
             for i in (begin + 1)..end {
-                let minimizer_pos = self.index.offsets.index_value(i) as u64;
-                if let Some(hit) = self.lookup_at_position(kmer, kmer_rc, minimizer_pos, mini.pos_in_kmer) {
-                    return hit.into_lookup_result(self.k);
+                let enc = self.index.offsets.index_value(i) as u64;
+                let dec = self.spss.decode_offset(enc);
+                if let Some(hit) = self.lookup_at_position(kmer, kmer_rc, &dec, mini.pos_in_kmer) {
+                    return hit.into_lookup_result(&self.spss);
                 }
             }
             crate::streaming_query::LookupResult::not_found()
@@ -367,8 +377,8 @@ impl Dictionary {
 
     /// The verification half of [`Self::lookup_with_minimizer`]: try the
     /// candidate loci of each position of the minimizer's locate set. The
-    /// positions must be the decoded locate set of `mini.value`, whose
-    /// presence at `positions[0]` has already been checked.
+    /// positions must be the decoded (absolute) locate set of `mini.value`,
+    /// whose presence at `positions[0]` has already been checked.
     pub(crate) fn lookup_at_positions<const K: usize>(
         &self,
         positions: &[u64],
@@ -380,11 +390,29 @@ impl Dictionary {
         Kmer<K>: KmerBits,
     {
         for &minimizer_pos in positions {
-            if let Some(hit) = self.lookup_at_position(kmer, kmer_rc, minimizer_pos, mini.pos_in_kmer) {
-                return hit.into_lookup_result(self.k);
+            if let Some(hit) =
+                self.lookup_at_absolute_position(kmer, kmer_rc, minimizer_pos, None, mini.pos_in_kmer)
+            {
+                return hit.into_lookup_result(&self.spss);
             }
         }
         crate::streaming_query::LookupResult::not_found()
+    }
+
+    /// As [`Self::lookup_at_absolute_position`], with the decoded super-kmer
+    /// offset providing both the minimizer position and the string hint.
+    #[inline]
+    fn lookup_at_position<const K: usize>(
+        &self,
+        kmer: &Kmer<K>,
+        kmer_rc: &Kmer<K>,
+        dec: &crate::spectrum_preserving_string_set::DecodedSkOffset,
+        pos_in_kmer: usize,
+    ) -> Option<LocatedHit>
+    where
+        Kmer<K>: KmerBits,
+    {
+        self.lookup_at_absolute_position(kmer, kmer_rc, dec.absolute, Some(dec), pos_in_kmer)
     }
 
     /// The minimizer is anchored at locus `pos_in_kmer` of the k-mer and, by
@@ -393,29 +421,38 @@ impl Dictionary {
     /// starting either at `j - pos_in_kmer` or at `j - (k - m - pos_in_kmer)`:
     /// always exactly two candidates, with no case analysis.
     #[inline]
-    fn lookup_at_position<const K: usize>(
+    fn lookup_at_absolute_position<const K: usize>(
         &self,
         kmer: &Kmer<K>,
         kmer_rc: &Kmer<K>,
         minimizer_pos: u64,
+        hint: Option<&crate::spectrum_preserving_string_set::DecodedSkOffset>,
         pos_in_kmer: usize,
     ) -> Option<LocatedHit>
     where
         Kmer<K>: KmerBits,
     {
-        if let Some(hit) = self.try_lookup_at(kmer, kmer_rc, minimizer_pos, pos_in_kmer as u64) {
+        if let Some(hit) = self.try_lookup_at(kmer, kmer_rc, minimizer_pos, hint, pos_in_kmer as u64) {
             return Some(hit);
         }
-        self.try_lookup_at(kmer, kmer_rc, minimizer_pos, (K - self.m - pos_in_kmer) as u64)
+        self.try_lookup_at(kmer, kmer_rc, minimizer_pos, hint, (K - self.m - pos_in_kmer) as u64)
     }
 
     /// Verify one candidate k-mer start against the SPSS text.
+    ///
+    /// On a text match, the k-mer must lie entirely within one string. The
+    /// common case is the string of the minimizer's own super-kmer (`hint`);
+    /// otherwise, with strings as overlapping intervals of one text, the only
+    /// other possibility is the unique interval fully containing the k-mer,
+    /// found by a successor query on the interval ends — or no interval at
+    /// all, in which case the candidate is rejected.
     #[inline]
     fn try_lookup_at<const K: usize>(
         &self,
         query_kmer: &Kmer<K>,
         kmer_rc: &Kmer<K>,
         minimizer_pos: u64,
+        hint: Option<&crate::spectrum_preserving_string_set::DecodedSkOffset>,
         pos_in_kmer: u64,
     ) -> Option<LocatedHit>
     where
@@ -433,12 +470,22 @@ impl Dictionary {
             return None;
         };
 
-        let (string_id, string_begin, string_end) = self.spss.locate_with_end(kmer_pos)?;
-        if kmer_pos >= string_begin && kmer_pos < string_end - self.k as u64 + 1 {
-            Some(LocatedHit { kmer_offset: kmer_pos, orientation, string_id, string_begin, string_end })
-        } else {
-            None
+        if let Some(h) = hint
+            && kmer_pos >= h.string_begin
+            && kmer_pos + self.k as u64 <= h.string_end
+        {
+            return Some(LocatedHit {
+                kmer_offset: kmer_pos,
+                orientation,
+                string_id: h.string_id,
+                string_begin: h.string_begin,
+                string_end: h.string_end,
+            });
         }
+
+        let (string_id, string_begin, string_end) =
+            self.spss.locate_kmer(kmer_pos, self.k as u64)?;
+        Some(LocatedHit { kmer_offset: kmer_pos, orientation, string_id, string_begin, string_end })
     }
 
     /// Check if a k-mer exists in the dictionary
@@ -506,6 +553,11 @@ impl Dictionary {
         self.spss.num_strings()
     }
 
+    /// Get the number of indexed k-mers
+    pub fn num_kmers(&self) -> u64 {
+        self.spss.num_kmers()
+    }
+
     /// Get the length of a specific string in bases
     pub fn string_length(&self, string_id: u64) -> usize {
         self.spss.string_length(string_id)
@@ -548,9 +600,7 @@ impl Dictionary {
 
     /// Print a detailed space breakdown of the index
     pub fn print_space_breakdown(&self) {
-        let num_kmers = self.spss.total_bases().saturating_sub(
-            (self.k as u64 - 1) * self.spss.num_strings()
-        ) as f64;
+        let num_kmers = self.spss.num_kmers() as f64;
 
         let strings_bytes = self.spss.strings_bytes() as f64;
         let offsets_bytes = self.spss.offsets_bytes() as f64;

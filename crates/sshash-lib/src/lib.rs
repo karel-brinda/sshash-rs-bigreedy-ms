@@ -15,6 +15,7 @@ pub mod minimizer;
 pub mod mphf_config;
 pub mod offsets;
 pub mod minimizers_control_map;
+pub mod masked_superstring;
 pub mod spectrum_preserving_string_set;
 pub mod partitioned_mphf;
 pub mod sparse_and_skew_index;
@@ -33,6 +34,7 @@ pub use minimizer::{
 pub use minimizers_control_map::{MinimizersControlMap, MinimizersControlMapBuilder, BucketType};
 pub use streaming_query::{LookupResult, StreamingQuery};
 pub use dictionary::Dictionary;
+pub use masked_superstring::{masked_superstring_intervals, MaskedSuperstringInterval};
 pub use kmer_dict_trait::{KmerDictionary, KmerStreamingQuery};
 pub use builder::{BuildConfiguration, CfSegData, DictionaryBuilder, parse_cf_seg};
 pub use partitioned_mphf::PartitionedMphf;

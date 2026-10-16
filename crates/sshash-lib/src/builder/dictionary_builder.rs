@@ -93,6 +93,67 @@ impl DictionaryBuilder {
         pool.install(|| self.build_from_sequences_inner(sequences))
     }
 
+    /// Build a dictionary from one KmerCamel-style masked superstring: a
+    /// single sequence over `ACGTacgt` where an uppercase base marks the
+    /// start of a represented k-mer and a lowercase base an unrepresented
+    /// one. Only the represented k-mers are indexed.
+    ///
+    /// **The mask must be min-one**: every represented k-mer must have
+    /// exactly one uppercase occurrence in the superstring (the default
+    /// output of `kmercamel compute`). Non-min-one masks are not detected
+    /// here and corrupt the k-mer ids; verify with the masked-superstring
+    /// check when the mask provenance is uncertain.
+    pub fn build_from_masked_superstring(&self, superstring: &str) -> Result<Dictionary, String> {
+        if self.config.weighted {
+            return Err("weighted dictionaries are not supported with masked-superstring input"
+                .to_string());
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.num_threads)
+            .build()
+            .map_err(|e| format!("Failed to create thread pool: {e}"))?;
+
+        pool.install(|| self.build_from_masked_superstring_inner(superstring))
+    }
+
+    fn build_from_masked_superstring_inner(&self, superstring: &str) -> Result<Dictionary, String> {
+        use crate::masked_superstring::{masked_superstring_intervals, validate_masked_superstring};
+
+        self.config.print();
+        info!("Building SSHash Dictionary from a masked superstring");
+
+        let seq = superstring.as_bytes();
+        validate_masked_superstring(seq)?;
+        let intervals = masked_superstring_intervals(seq, self.config.k)?;
+
+        // Pack the whole superstring once; the intervals reference it.
+        let mut strings = vec![0u8; seq.len().div_ceil(4)];
+        for (i, &base) in seq.iter().enumerate() {
+            let encoded = crate::encoding::encode_base(base)
+                .map_err(|_| format!("Invalid base at position {}: {:?}", i, base as char))?;
+            strings[i / 4] |= encoded << ((i % 4) * 2);
+        }
+
+        let begins: Vec<u64> = intervals.iter().map(|iv| iv.begin).collect();
+        let ends: Vec<u64> = intervals.iter().map(|iv| iv.end).collect();
+        let spss = SpectrumPreservingStringSet::from_interval_vecs(
+            strings,
+            begins,
+            ends,
+            self.config.k,
+            self.config.m,
+        );
+
+        info!(
+            "  Read masked superstring of {} bases: {} strings (maximal runs of represented kmer starts), {} kmers",
+            seq.len(),
+            spss.num_strings(),
+            spss.num_kmers()
+        );
+
+        self.build_from_spss(spss)
+    }
+
     /// Inner build logic, runs inside the rayon thread pool
     fn build_from_sequences_inner(&self, sequences: Vec<String>) -> Result<Dictionary, String> {
         self.config.print();
@@ -104,11 +165,14 @@ impl DictionaryBuilder {
         info!("  Encoded {} sequences", num_sequences);
         info!("  Total bases: {}", spss.total_bases());
 
+        self.build_from_spss(spss)
+    }
+
+    /// Shared pipeline: minimizer tuples, buckets, MPHF and the sparse/skew
+    /// index, from an already-constructed SPSS (plain or interval-based).
+    fn build_from_spss(&self, spss: SpectrumPreservingStringSet) -> Result<Dictionary, String> {
         // Decide between external sort (streaming from disk) or in-memory paths
-        let total_bases = spss.total_bases();
-        let num_strings = spss.num_strings();
-        let k = self.config.k as u64;
-        let total_kmers = total_bases.saturating_sub(num_strings * (k - 1));
+        let total_kmers = spss.num_kmers();
 
         if self.config.force_external_sort
             || needs_external_sorting(total_kmers, self.config.ram_limit_gib)
@@ -334,8 +398,7 @@ impl DictionaryBuilder {
         mphf_order: Option<Vec<usize>>,
         spss: &SpectrumPreservingStringSet,
     ) -> Result<SparseAndSkewIndex, String> {
-        let total_bases = spss.total_bases();
-        let num_bits_per_offset = crate::constants::ceil_log2(total_bases);
+        let num_bits_per_offset = spss.num_bits_per_offset();
 
         let index = crate::dispatch_on_k!(self.config.k, K => {
             SparseAndSkewIndex::build_from_file::<K>(
@@ -414,8 +477,7 @@ impl DictionaryBuilder {
         mphf_order: Option<&[usize]>,
         spss: &SpectrumPreservingStringSet,
     ) -> Result<SparseAndSkewIndex, String> {
-        let total_bases = spss.total_bases();
-        let num_bits_per_offset = crate::constants::ceil_log2(total_bases);
+        let num_bits_per_offset = spss.num_bits_per_offset();
 
         let index = crate::dispatch_on_k!(self.config.k, K => {
             SparseAndSkewIndex::build_from_classified::<K>(classified, mphf_order, num_bits_per_offset, spss)

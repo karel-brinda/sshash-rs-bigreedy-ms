@@ -64,7 +64,12 @@ const MPHF_MAGIC: &[u8; 8] = b"SSHIMH02";
 ///   sshash-rs 0.7): canonical m-mer at forward density with the
 ///   centre-closest tie-break; header gains `seed` and `hasher_magic`;
 ///   the canonical flag is always 1.
-const FORMAT_VERSION: (u32, u32) = (5, 0);
+/// - (6, 0): interval-based string offsets (BiGreedy masked-superstring
+///   support): the SPSS stores interval begins/ends/cumulative k-mer counts
+///   over one shared text, and super-kmer offsets are encoded as
+///   `| string-id | relative offset |`. Plain SPSS inputs are the degenerate
+///   case; indexes from format 5 must be rebuilt.
+const FORMAT_VERSION: (u32, u32) = (6, 0);
 const MPHF_FORMAT_VERSION: (u32, u32) = (2, 0);
 
 /// Header for the serialized Dictionary
