@@ -1,3 +1,41 @@
+# SSHash-rs-BiGreedy-MS — SSHash-rs for BiGreedy masked superstrings
+
+> [!IMPORTANT]
+> **This repository ([karel-brinda/sshash-rs-bigreedy-ms](https://github.com/karel-brinda/sshash-rs-bigreedy-ms))
+> is a fork of [sshash-rs](https://github.com/COMBINE-lab/sshash-rs), the Rust implementation of
+> SSHash, extended to natively index
+> [masked superstrings](https://doi.org/10.1101/2023.02.01.526717) computed by BiGreedy, as
+> output by [KmerCamel](https://github.com/ondrejsladky/kmercamel). It is a Rust port of the
+> C++ fork [karel-brinda/sshash-bigreedy-ms](https://github.com/karel-brinda/sshash-bigreedy-ms).**
+>
+> * **New input format.** `--masked-superstring` indexes one KmerCamel-style masked superstring:
+>   a single FASTA record over `ACGTacgt`, where an uppercase base marks the start of a
+>   represented k-mer and a lowercase base an unrepresented one:
+>
+>       kmercamel compute -k 31 -o out.msfa input.fa
+>       sshash build --input out.msfa -k 31 -m 16 --masked-superstring --output out
+>
+>   Only the represented k-mers are indexed; the maximal uppercase runs play the role of
+>   SSHash's strings (possibly overlapping intervals of the one superstring), and the full
+>   dictionary interface (lookup with unique k-mer ids, streaming and point queries) is
+>   preserved.
+> * **The mask must be min-one: every represented k-mer has exactly one uppercase occurrence.**
+>   This is what makes the k-mer ↔ id bijection well defined. Min-one is the default mask of
+>   `kmercamel compute`; other masks — e.g., max-one (`kmercamel maskopt -t max-one`), matchtig
+>   input (`kmercamel compute -S`), or concatenations of masked superstrings sharing k-mers —
+>   are **not supported and not detected during construction**. When the mask provenance is
+>   uncertain, run `sshash check --index out --input out.msfa --masked-superstring`, which
+>   fails on any non-min-one mask.
+> * **Plain SPSS inputs** (unitigs, simplitigs, eulertigs; FASTA/FASTQ) are indexed exactly as
+>   upstream, as the degenerate case of the same representation. `scripts/ms-benchmark.sh`
+>   compares index size and query time of the two representations of one k-mer set.
+>   **Index files are not interchangeable with the upstream sshash-rs** (format 6.0: interval
+>   offsets, string-id-encoded super-kmer offsets).
+
+---
+
+*What follows is the original sshash-rs documentation.*
+
 # SSHash-rs
 
 Rust implementation of [**SSHash**](https://github.com/jermp/sshash): **S**parse and **S**kew **Hash**ing of k-mers.
